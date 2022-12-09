@@ -411,7 +411,10 @@ struct tree_node_container : tree_node {
 };
 
 /// The root of the AST.
-struct tree_node_root final : tree_node_container {};
+struct tree_node_root final : tree_node_container {
+    std::string code_before;
+    std::string code_after;
+};
 
 /// The root may contain code.
 struct tree_node_code final : tree_node {
@@ -458,19 +461,25 @@ struct parser : lexer {
     /// <grammar> ::= <rule> | CODE
     tree parse() {
         auto [root, t] = make<tree_node_root>();
+        bool rule_seen = false;
+
+        /// Parse the rules and top-level code.
         while (tok.type != tk::eof) {
-            /// Add code as a node to the root.
+            /// Add code to the root.
             if (tok.type == tk::code) {
-                auto [code, node] = make<tree_node_code>();
-                code->text = std::move(tok.text);
-                tok.text = {};
-                root->add(std::move(node));
-                next();
+                if (not rule_seen) root->code_before += tok.text;
+                else root->code_after += tok.text;
             }
 
             /// Parse a rule and add it.
-            else { root->add(parse_rule()); }
+            else {
+                rule_seen = true;
+                root->add(parse_rule());
+            }
         }
+
+        /// Need at least one rule.
+        if (not rule_seen) err(root->pos, "Expected at least one rule");
         return std::move(t);
     }
 
@@ -588,63 +597,247 @@ struct parser : lexer {
     }
 };
 
-/// Print a tree.
-void print_tree(const tree_node* t, std::string leading_text = "") {
-    static const auto dump_children = [](const std::vector<tree>& children, std::string text) {
-        for (auto it = children.begin(); it != children.end(); ++it) {
-            fmt::print("\033[31m{}{}", text, it + 1 == children.end() ? "└─" : "├─");
-            print_tree(it->get(), text + (it + 1 == children.end() ? "  " : "│ "));
+/// ===========================================================================
+///  Print the AST.
+/// ===========================================================================
+/// Print a rule as BNF.
+std::string print_as_bnf(const tree_node* node) {
+    std::string s;
+
+    /// Rule.
+    if (auto rule = dynamic_cast<const tree_node_rule*>(node)) {
+        /// Print the rule name.
+        s += fmt::format("<{}> ::= ", rule->nonterminal);
+
+        /// Print the alternatives.
+        for (auto it = rule->children.begin(); it != rule->children.end(); ++it) {
+            if (it != rule->children.begin()) s += fmt::format(" | ");
+            s += print_as_bnf(it->get());
         }
+    }
+
+    /// Alternatives.
+    else if (auto alt = dynamic_cast<const tree_node_alternative*>(node)) {
+        /// Print the terms.
+        for (auto it = alt->children.begin(); it != alt->children.end(); ++it) {
+            if (it != alt->children.begin()) s += fmt::format(" ");
+            s += print_as_bnf(it->get());
+        }
+    }
+
+    /// Nonterminal.
+    else if (auto nt = dynamic_cast<const tree_node_nonterminal*>(node)) {
+        s += fmt::format("<{}>", nt->text);
+    }
+
+    /// Identifier.
+    else if (auto id = dynamic_cast<const tree_node_identifier*>(node)) {
+        s += fmt::format("{}", id->text);
+    }
+
+    /// Group.
+    else if (auto group = dynamic_cast<const tree_node_group*>(node)) {
+        s += fmt::format("( ");
+        s += print_as_bnf(group->children[0].get());
+        s += fmt::format(" )");
+    }
+
+    /// Optional.
+    else if (auto opt = dynamic_cast<const tree_node_optional*>(node)) {
+        s += fmt::format("[ ");
+        s += print_as_bnf(opt->children[0].get());
+        s += fmt::format(" ]");
+    }
+
+    /// Repetition.
+    else if (auto rep = dynamic_cast<const tree_node_repetition*>(node)) {
+        s += fmt::format("{{ ");
+        s += print_as_bnf(rep->children[0].get());
+        s += fmt::format(" }}");
+    }
+
+    /// Don’t print anything else.
+    else {}
+
+    /// Done.
+    return s;
+}
+
+/// Print a parse tree.
+std::string print_tree(const tree_node* t, const std::string& leading_text = "") {
+    static const auto dump_children = [](const std::vector<tree>& children, std::string text) -> std::string {
+        std::string s;
+        for (auto it = children.begin(); it != children.end(); ++it) {
+            s += fmt::format("\033[31m{}{}", text, it + 1 == children.end() ? "└─" : "├─");
+            s += print_tree(it->get(), text + (it + 1 == children.end() ? "  " : "│ "));
+        }
+        return s;
     };
+
+    /// Return string.
+    std::string s;
 
     /// Root node.
     if (auto* root = dynamic_cast<const tree_node_root*>(t)) {
-        for (auto& child : root->children) print_tree(child.get());
+        for (auto it = root->children.begin(); it != root->children.end(); ++it) {
+            if (it != root->children.begin()) s += fmt::format("\n");
+            s += print_tree(it->get());
+        }
     }
 
     /// Rule node.
     else if (auto* rule = dynamic_cast<const tree_node_rule*>(t)) {
-        fmt::print("\033[31mRule \033[35m<{}>\n", t->pos.start);
-        dump_children(rule->children, leading_text);
+        s += fmt::format("\033[37m/// ");
+        s += print_as_bnf(rule);
+        s += fmt::format("\n\033[31mRule \033[35m<{}>\n", t->pos.start);
+        s += dump_children(rule->children, leading_text);
     }
 
     /// Alternative node.
     else if (auto* alt = dynamic_cast<const tree_node_alternative*>(t)) {
-        fmt::print("\033[31mAlternative \033[35m<{}>\n", t->pos.start);
-        dump_children(alt->children, leading_text);
+        s += fmt::format("\033[31mAlternative \033[35m<{}>\n", t->pos.start);
+        s += dump_children(alt->children, leading_text);
     }
 
     /// Nonterminal node.
     else if (auto* nt = dynamic_cast<const tree_node_nonterminal*>(t)) {
-        fmt::print("\033[31mNonterminal \033[35m<{}> \033[32m<{}>\033[0m\n", t->pos.start, nt->text);
+        s += fmt::format("\033[31mNonterminal \033[35m<{}> \033[32m<{}>\033[0m\n", t->pos.start, nt->text);
     }
 
     /// Identifier node.
     else if (auto* id = dynamic_cast<const tree_node_identifier*>(t)) {
-        fmt::print("\033[31mIdentifier \033[35m<{}> \033[33m{}\033[0m\n", t->pos.start, id->text);
+        s += fmt::format("\033[31mIdentifier \033[35m<{}> \033[33m{}\033[0m\n", t->pos.start, id->text);
     }
 
     /// Group node.
     else if (auto* group = dynamic_cast<const tree_node_group*>(t)) {
-        fmt::print("\033[31mGroup \033[35m<{}>\n", t->pos.start);
-        dump_children(group->children, leading_text);
+        s += fmt::format("\033[31mGroup \033[35m<{}>\n", t->pos.start);
+        s += dump_children(group->children, leading_text);
     }
 
     /// Optional node.
     else if (auto* opt = dynamic_cast<const tree_node_optional*>(t)) {
-        fmt::print("\033[31mOptional \033[35m<{}>\n", t->pos.start);
-        dump_children(opt->children, leading_text);
+        s += fmt::format("\033[31mOptional \033[35m<{}>\n", t->pos.start);
+        s += dump_children(opt->children, leading_text);
     }
 
     /// Repetition node.
     else if (auto* rep = dynamic_cast<const tree_node_repetition*>(t)) {
-        fmt::print("\033[31mRepetition \033[35m<{}>\n", t->pos.start);
-        dump_children(rep->children, leading_text);
+        s += fmt::format("\033[31mRepetition \033[35m<{}>\n", t->pos.start);
+        s += dump_children(rep->children, leading_text);
+    }
+
+    /// Unknown node.
+    else { throw std::runtime_error("Unknown node type"); }
+
+    /// Done.
+    return s;
+}
+
+/// ===========================================================================
+///  Emit code.
+/// ===========================================================================
+struct emit_options {
+    std::string parser_namespace = "ff";
+    std::string parser_name = "parser";
+    std::string parser_base_class;
+    std::string parser_base_initialiser;
+};
+
+/// Emit C++ code that implements a recursive-descent parser that parses a tree.
+void emit(const tree_node* t, std::string& out, emit_options& opts) {
+    /// Emit the root.
+    if (const auto* root = dynamic_cast<const tree_node_root*>(t)) {
+        /// This is a good place to emit the parser skeleton.
+        fmt::format_to(std::back_inserter(out), R"c++(/// =========================================================================== ///
+///                                                                             ///
+///            This file was generated from <FILENAME> using EBNFC              ///
+///                                                                             ///
+/// =========================================================================== ///
+
+/// Include the parser skeleton.
+#define EBNFC_NAMESPACE_NAME {0}
+#include <ebnfc/skeleton.hh>
+#undef EBNFC_NAMESPACE_NAME
+
+/// Parser namespace.
+namespace {1} {{
+
+/// Code specified before any rules.
+{2}
+
+/// Main parser context.
+struct {3} {4}{5} {{
+    /// Create a new parser.
+    parser(std::string_view code, std::string_view path) {6}{7} {{}}
+
+    /// Read the next token.
+    void next();
+
+    /// Make a new AST node.
+    template <typename node>
+    requires requires {{ static_cast<node*>(std::declval<tree_node*>()); }}
+    auto make() -> std::pair<node*, tree> {{
+        auto t = new node{{}};
+        return {{t, tree{{static_cast<tree_node*>(t)}}}};
+    }}
+
+)c++",
+                       opts.parser_namespace,                            /// 0
+                       opts.parser_namespace,                            /// 1
+                       root->code_before,                                /// 2
+                       opts.parser_name,                                 /// 3
+                       opts.parser_base_class.empty() ? "" : ": ",       /// 4
+                       opts.parser_base_class,                           /// 5
+                       opts.parser_base_initialiser.empty() ? "" : ": ", /// 6
+                       opts.parser_base_initialiser);                    /// 7
+
+        for (auto& child : root->children) emit(child.get(), out, opts);
+
+        /// Emit the rest of the parser skeleton.
+        fmt::format_to(std::back_inserter(out), R"c++(}}
+
+/// Code specified after any rules.
+{}
+
+}} // namespace {}
+)c++",
+                       root->code_after, opts.parser_namespace);
+    }
+
+    /// Emit a function to parse the rule.
+    else if (const auto* rule = dynamic_cast<const tree_node_rule*>(t)) {
+        /// Emit the rule as a comment.
+        out += "    /// ";
+        out += print_as_bnf(rule);
+        out += "\n";
+
+        /// Print the start of the function.
+        fmt::format_to(std::back_inserter(out), "    auto parse_{}() -> tree {{\n"
+                                                "        tree $0;\n\n",
+                       rule->nonterminal);
+
+        /// Emit each alternative.
+        /// TODO: Handle left-recursion.
+        for (const auto& alt : rule->children) emit(alt.get(), out, opts);
+
+        /// Emit the end of the function.
+        fmt::format_to(std::back_inserter(out), "        /// If no alternative matches, return an error.\n"
+                                                "        else error(here(), \"Unexpected token\");\n"
+                                                "        return $0;\n"
+                                                "    }}\n\n");
+    }
+
+    /// Emit an alternative.
+    else if (const auto* alt = dynamic_cast<const tree_node_alternative*>(t)) {
+        /// If the first term of the alternative is a nonterminal, call the
+        /// function that parses that nonterminal; otherwise, match the token.
+        /// TODO.
     }
 
     /// Unknown node.
     else {
-        fmt::print("\033[31mUnknown node\033[0m\n");
+        die("Unknown node type");
     }
 }
 
