@@ -1,0 +1,8 @@
+<grammar> ::= <rule> | CODE
+<rule> ::= NONTERMINAL ASSIGN <alternatives> [ SEMICOLON ]
+<alternatives> ::= <alternative> { ALTERNATIVE <alternative> }
+<alternative> ::= <term> { <term> } [ ARROW IDENTIFIER ] [ CODE ]
+<term> ::= NONTERMINAL | IDENTIFIER | <group> | <optional> | <repetition>
+<group> ::= LPAREN <alternatives> RPAREN
+<optional> ::= LBRACK <alternatives> RBRACK
+<repetition> ::= LBRACE <alternatives> RBRACE

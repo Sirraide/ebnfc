@@ -1,0 +1,41 @@
+## Parser for a simple expression grammar.
+
+## `%{}%` inserts C++ code into the generated parser.
+## If used at the global scope, the code is inserted
+## into the generated parser namespace.
+##
+## The `tree` struct is used to represent the parse tree.
+## Since this grammar is just for arithmetic expressions,
+## the tree nodes are just integers.
+%{ using tree = int64_t; }%
+
+## Rules are defined using EBNF. Non-terminals are enclosed
+## in angle brackets. The `::=` operator is used to define
+## a rule. The `|` operator is used to define alternatives.
+##
+## A %{}% block is used to provide C++ code that is executed
+## when the rule is matched. $0 represents the `tree` variable
+## returned by the rule. Normally, $1, $2, etc. are the `tree`s
+## of the non-terminals matched by the rule or the `token`s of
+## the terminals matched by the rule.
+##
+## See the definition of <addop> for an explanation as to why
+## it is of type `tk`, even though it is a non-terminal.
+##
+## The `tk` enum contains the token types. The names of all
+## terminals, converted to lowercase, are added to the enum.
+<expr> ::= <term> { <addop> <term> } %{
+    $0 = $2 == tk::plus ? $1 + $3 : $1 - $3;
+}%
+
+<term> ::= <factor> { <mulop> <factor> } %{
+    $0 = $2 == tk::times ? $1 * $3 : $1 / $3;
+}%
+
+## A %{}% block is only applied to a single alternative.
+<factor> ::= NUMBER               %{ $0 = $1.integer; }%
+           | LPAREN <expr> RPAREN %{ $0 = $2; }%
+
+## The `->` operator can be used to define the return value of a rule.
+<addop> ::= ( PLUS | MINUS )   -> tk %{ $0 = $1; }%
+<mulop> ::= ( TIMES | DIVIDE ) -> tk %{ $0 = $1; }%

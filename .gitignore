@@ -1,0 +1,12 @@
+## IDE and editor files.
+.idea/
+.vscode/
+.cache/
+
+## Build files.
+out/
+ebnfc
+ebnfc.exe
+
+## Valgrind.
+callgrind.out.*
