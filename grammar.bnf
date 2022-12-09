@@ -1,3 +1,7 @@
+%{
+#include <ast.hh>
+}%
+
 <grammar> ::= <rule> | CODE
 <rule>    ::= NONTERMINAL ASSIGN <alternatives> [ SEMICOLON ]
 

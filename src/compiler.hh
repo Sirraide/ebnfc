@@ -312,34 +312,42 @@ struct lexer {
                 tok.type = tk::lparen;
                 next_char();
                 break;
+
             case ')':
                 tok.type = tk::rparen;
                 next_char();
                 break;
+
             case '[':
                 tok.type = tk::lbrack;
                 next_char();
                 break;
+
             case ']':
                 tok.type = tk::rbrack;
                 next_char();
                 break;
+
             case '{':
                 tok.type = tk::lbrace;
                 next_char();
                 break;
+
             case '}':
                 tok.type = tk::rbrace;
                 next_char();
                 break;
+
             case ';':
                 tok.type = tk::semicolon;
                 next_char();
                 break;
+
             case '|':
                 tok.type = tk::alternative;
                 next_char();
                 break;
+
             case '<':
                 next_char();
                 tok.type = tk::nonterminal;
@@ -347,6 +355,37 @@ struct lexer {
                 if (lastc != '>') err(tok.pos, "Expected '>' at end of nonterminal");
                 next_char();
                 break;
+
+            case '%':
+                next_char();
+                if (lastc != '{') err(tok.pos, "Expected '{{' after '%'");
+                next_char();
+                tok.text.clear();
+
+                /// Search for the next %.
+                skip_whitespace();
+                while (lastc) {
+                    if (lastc == '}') {
+                        next_char();
+                        if (lastc == '%') {
+                            next_char();
+                            break;
+                        }
+                        tok.text += '}';
+                    } else {
+                        tok.text += lastc;
+                        next_char();
+                    }
+                }
+
+                /// Trim whitespace from the end of the text.
+                while (not tok.text.empty() and std::isspace(tok.text.back())) tok.text.pop_back();
+
+                /// Make sure we have a closing delimiter.
+                if (lastc == 0) err(tok.pos, "Code block terminated by end of file");
+                tok.type = tk::code;
+                break;
+
             case ':':
                 next_char();
                 if (lastc != ':') err(tok.pos, "Expected `::=`");
@@ -364,8 +403,7 @@ struct lexer {
                 }
 
                 /// Error.
-                else
-                    err({here() - 1, here()}, "invalid character");
+                else { err({here() - 1, here()}, "invalid character"); }
             }
         }
 
@@ -459,8 +497,8 @@ struct parser : lexer {
     }
 
     /// <grammar> ::= <rule> | CODE
-    tree parse() {
-        auto [root, t] = make<tree_node_root>();
+    std::unique_ptr<tree_node_root> parse() {
+        auto root = std::make_unique<tree_node_root>();
         bool rule_seen = false;
 
         /// Parse the rules and top-level code.
@@ -469,6 +507,7 @@ struct parser : lexer {
             if (tok.type == tk::code) {
                 if (not rule_seen) root->code_before += tok.text;
                 else root->code_after += tok.text;
+                next();
             }
 
             /// Parse a rule and add it.
@@ -480,7 +519,7 @@ struct parser : lexer {
 
         /// Need at least one rule.
         if (not rule_seen) err(root->pos, "Expected at least one rule");
-        return std::move(t);
+        return root;
     }
 
     /// <rule> ::= NONTERMINAL ASSIGN <alternatives> [ SEMICOLON ]
@@ -744,12 +783,96 @@ struct emit_options {
     std::string parser_base_initialiser;
 };
 
-/// Emit C++ code that implements a recursive-descent parser that parses a tree.
-void emit(const tree_node* t, std::string& out, emit_options& opts) {
-    /// Emit the root.
-    if (const auto* root = dynamic_cast<const tree_node_root*>(t)) {
-        /// This is a good place to emit the parser skeleton.
-        fmt::format_to(std::back_inserter(out), R"c++(/// =========================================================================== ///
+/// Start tokens for a rule.
+struct start_token_entry {
+    std::vector<std::pair<std::string, const tree_node*>> toks;
+    std::vector<const tree_node *> checked;
+};
+
+/// Forward-declared here because mutual recursion.
+void collect_start_tokens (const tree_node_root* root, const tree_node_alternative* alt, start_token_entry& tokens);
+
+/// Add the start tokens of a term.
+void add_start_tokens (
+    const tree_node_root *root,
+    const tree_node* term,
+    start_token_entry& tokens
+) {
+    /// Return if we have already checked this term.
+    if (std::find(tokens.checked.begin(), tokens.checked.end(), term) != tokens.checked.end()) return;
+    tokens.checked.push_back(term);
+
+    /// Terminal.
+    if (const auto* id = dynamic_cast<const tree_node_identifier*>(term)) {
+        tokens.toks.emplace_back(id->text, term);
+        return;
+    }
+
+    /// Nonterminal.
+    if (const auto* nt = dynamic_cast<const tree_node_nonterminal*>(term)) {
+        /// Find the rule that corresponds to this nonterminal.
+        auto corr_rule = std::find_if(root->children.begin(), root->children.end(), [&nt](auto& r) {
+            return dynamic_cast<const tree_node_rule*>(r.get())->nonterminal == nt->text;
+        });
+
+        /// There should always be a rule for a nonterminal.
+        if (corr_rule == root->children.end()) throw std::runtime_error("No rule for nonterminal");
+
+        /// Add the start tokens of each alternative.
+        for (auto& alt : dynamic_cast<const tree_node_rule*>((*corr_rule).get())->children) {
+            collect_start_tokens(root, static_cast<const tree_node_alternative*>(alt.get()), tokens);
+        }
+        return;
+    }
+
+    /// Group.
+    if (const auto* g = dynamic_cast<const tree_node_group*>(term)) {
+        for (auto& child : g->children) add_start_tokens(root, child.get(), tokens);
+        return;
+    }
+
+    /// Optional/Repetition.
+    if (const auto* opt = dynamic_cast<const tree_node_container*>(term)) {
+        add_start_tokens(root, opt->children[0].get(), tokens);
+        return;
+    }
+}
+
+/// Collect start tokens of an alternative.
+///
+/// The first relevant term of an alternative is the first term that
+/// is not an optional or repetition; The start tokens of an alternative
+/// are the first relevant term if that term is a terminal, or the start
+/// tokens of all alternatives of the first relevant term if that term is
+/// a nonterminal or group.
+///
+/// The start tokens of each term before the first relevant term also need
+/// to be added.
+void collect_start_tokens (
+    const tree_node_root *root,
+    const tree_node_alternative* alt,
+    start_token_entry& tokens
+) {
+    /// Find the first relevant term.
+    auto first_relevant_term = std::find_if(alt->children.begin(), alt->children.end(), [](const auto& node) {
+        return !dynamic_cast<const tree_node_optional*>(node.get()) && !dynamic_cast<const tree_node_repetition*>(node.get());
+    });
+
+    /// No relevant term — error.
+    if (first_relevant_term == alt->children.end()) throw std::runtime_error("No relevant term in alternative");
+
+    /// Add the start tokens of all terms up to the first relevant term.
+    for (auto it = alt->children.begin(); it != first_relevant_term; ++it) {
+        add_start_tokens(root, it->get(), tokens);
+    }
+
+    /// Add the start tokens of the first relevant term.
+    add_start_tokens(root, first_relevant_term->get(), tokens);
+}
+
+/// Emit the start of the parser skeleton.
+void emit_skeleton(const tree_node_root* root, std::string& out, emit_options& opts) {
+    fmt::format_to(std::back_inserter(out), R"c++(/// =========================================================================== ///
 ///                                                                             ///
 ///            This file was generated from <FILENAME> using EBNFC              ///
 ///                                                                             ///
@@ -760,11 +883,11 @@ void emit(const tree_node* t, std::string& out, emit_options& opts) {
 #include <ebnfc/skeleton.hh>
 #undef EBNFC_NAMESPACE_NAME
 
-/// Parser namespace.
-namespace {1} {{
-
 /// Code specified before any rules.
 {2}
+
+/// Parser namespace.
+namespace {1} {{
 
 /// Main parser context.
 struct {3} {4}{5} {{
@@ -783,62 +906,91 @@ struct {3} {4}{5} {{
     }}
 
 )c++",
-                       opts.parser_namespace,                            /// 0
-                       opts.parser_namespace,                            /// 1
-                       root->code_before,                                /// 2
-                       opts.parser_name,                                 /// 3
-                       opts.parser_base_class.empty() ? "" : ": ",       /// 4
-                       opts.parser_base_class,                           /// 5
-                       opts.parser_base_initialiser.empty() ? "" : ": ", /// 6
-                       opts.parser_base_initialiser);                    /// 7
+                   opts.parser_namespace,                            /// 0
+                   opts.parser_namespace,                            /// 1
+                   root->code_before,                                /// 2
+                   opts.parser_name,                                 /// 3
+                   opts.parser_base_class.empty() ? "" : ": ",       /// 4
+                   opts.parser_base_class,                           /// 5
+                   opts.parser_base_initialiser.empty() ? "" : ": ", /// 6
+                   opts.parser_base_initialiser);                    /// 7
+}
 
-        for (auto& child : root->children) emit(child.get(), out, opts);
+/// Emit a rule.
+void emit_rule(
+    const tree_node_root *root,
+    const tree_node_rule *rule,
+    std::string& out
+) {
+    /// Emit the rule as a comment.
+    out += "    /// ";
+    out += print_as_bnf(rule);
+    out += "\n";
 
-        /// Emit the rest of the parser skeleton.
-        fmt::format_to(std::back_inserter(out), R"c++(}}
+    /// Print the start of the function.
+    fmt::format_to(std::back_inserter(out), "    auto parse_{}() -> tree {{\n"
+                                            "        tree $0;\n\n",
+                   rule->nonterminal);
 
-/// Code specified after any rules.
-{}
 
-}} // namespace {}
-)c++",
-                       root->code_after, opts.parser_namespace);
+    /// The start tokens for all alternatives of this rule.
+    std::vector<start_token_entry> start_tokens;
+
+    /// Collect the start tokens for each alternative.
+    for (auto& alt : rule->children) {
+        start_token_entry tokens;
+        collect_start_tokens(root, static_cast<const tree_node_alternative*>(alt.get()), tokens);
+        start_tokens.push_back(std::move(tokens));
     }
 
-    /// Emit a function to parse the rule.
-    else if (const auto* rule = dynamic_cast<const tree_node_rule*>(t)) {
-        /// Emit the rule as a comment.
-        out += "    /// ";
-        out += print_as_bnf(rule);
+    /// Dump the start tokens.
+    for (size_t i = 0; i < start_tokens.size(); ++i) {
+        fmt::format_to(std::back_inserter(out), "        /// Alternative {}:\n", i);
+        for (auto& [token, term] : start_tokens[i].toks) {
+            fmt::format_to(std::back_inserter(out), "        ///     {}\n", token);
+        }
         out += "\n";
-
-        /// Print the start of the function.
-        fmt::format_to(std::back_inserter(out), "    auto parse_{}() -> tree {{\n"
-                                                "        tree $0;\n\n",
-                       rule->nonterminal);
-
-        /// Emit each alternative.
-        /// TODO: Handle left-recursion.
-        for (const auto& alt : rule->children) emit(alt.get(), out, opts);
-
-        /// Emit the end of the function.
-        fmt::format_to(std::back_inserter(out), "        /// If no alternative matches, return an error.\n"
-                                                "        else error(here(), \"Unexpected token\");\n"
-                                                "        return $0;\n"
-                                                "    }}\n\n");
     }
 
-    /// Emit an alternative.
-    else if (const auto* alt = dynamic_cast<const tree_node_alternative*>(t)) {
-        /// If the first term of the alternative is a nonterminal, call the
-        /// function that parses that nonterminal; otherwise, match the token.
-        /// TODO.
-    }
+    /*        /// Emit each alternative w/ index.
+            for (size_t i = 0; i < rule->children.size(); ++i) {
+                /// If the first term of the alternative is a nonterminal, call the
+                /// function that parses that nonterminal; otherwise, match the token.
+                auto* alt = static_cast<const tree_node_alternative*>(rule->children[i].get());
+                if (const auto* nt = dynamic_cast<const tree_node_nonterminal*>(alt->children.front().get())) {
+                    fmt::format_to(std::back_inserter(out), "        if (auto $1 = parse_{}()) {{\n"
+                                                            "            $0 = std::move($1);\n"
+                                                            "        }}\n",
+                                   nt->text);
+                } else {
+                    fmt::format_to(std::back_inserter(out), "        if (auto $1 = match({})) {{\n"
+                                                            "            $0 = std::move($1);\n"
+                                                            "        }}\n",
+                                   print_as_bnf(rule->children[i].get()));
+                }
+            }*/
 
-    /// Unknown node.
-    else {
-        die("Unknown node type");
-    }
+    /// Emit the end of the function.
+    fmt::format_to(std::back_inserter(out), "        /// If no alternative matches, return an error.\n"
+                                            "        else error(here(), \"Unexpected token\");\n"
+                                            "        return $0;\n"
+                                            "    }}\n\n");
+}
+
+/// Emit C++ code that implements a recursive-descent parser that parses a tree.
+void emit(const tree_node_root* root, std::string& out, emit_options& opts) {
+    /// This is a good place to emit the parser skeleton.
+    emit_skeleton(root, out, opts);
+
+    /// Emit all rules.
+    for (auto& child : root->children) emit_rule(root, static_cast<tree_node_rule*>(child.get()), out);
+
+    /// Emit the rest of the parser skeleton.
+    fmt::format_to(std::back_inserter(out), "}}\n\n"
+                                            "/// Code specified after any rules.\n"
+                                            "{}\n\n"
+                                            "}} // namespace {}\n",
+                   root->code_after, opts.parser_namespace);
 }
 
 } // namespace ebnfc
