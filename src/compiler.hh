@@ -22,6 +22,12 @@ struct parse_error : std::runtime_error {
 };
 
 /// ===========================================================================
+///  Context
+/// ===========================================================================
+struct context {
+};
+
+/// ===========================================================================
 ///  Tokens
 /// ===========================================================================
 enum struct tk : u8 {
@@ -357,7 +363,8 @@ struct lexer {
                 }
 
                 /// Error.
-                else err({here() - 1, here()}, "invalid character");
+                else
+                    err({here() - 1, here()}, "invalid character");
             }
         }
 
@@ -373,6 +380,96 @@ struct lexer {
         } while (tok.type != tk::eof);
     }
 };
+
+/// ===========================================================================
+///  AST
+/// ===========================================================================
+/// Base for a node in the AST.
+struct tree_node {
+    loc pos;
+    tree_node* parent;
+    virtual ~tree_node() {}
+};
+
+/// Tree node.
+using tree = std::unique_ptr<tree_node>;
+
+/// An AST node containing child nodes.
+struct tree_node_container : public tree_node {
+    tree_node_container() = default;
+    std::vector<tree> children;
+
+    void add(tree&& t) {
+        t->parent = this;
+        children.push_back(std::move(t));
+    }
+};
+
+/// The root of the AST.
+struct tree_node_root : tree_node_container {};
+
+/// The root may contain code.
+struct tree_node_code : tree_node {
+    std::string text;
+};
+
+/// A rule in the AST.
+struct tree_node_rule : public tree_node_container {
+    std::string nonterminal;
+};
+
+/// An alternative of a rule.
+struct tree_node_alternative : public tree_node_container {
+    std::string return_type;
+    std::string code;
+};
+
+/// A term in an alternative.
+struct tree_node_nonterminal : tree_node {
+    std::string text;
+};
+struct tree_node_identifier : tree_node {
+    std::string text;
+};
+struct tree_node_group : tree_node_container {};
+struct tree_node_optional : tree_node_container {};
+struct tree_node_repetition : tree_node_container {};
+
+/// ===========================================================================
+///  Parser
+/// ===========================================================================
+struct parser : lexer {
+    /// Forward input and filename to the lexer.
+    parser(std::string input, std::string filename) : lexer(std::move(input), std::move(filename)) {}
+
+    /// Make a new AST node.
+    template <typename node>
+    requires requires { static_cast<node*>(std::declval<tree_node*>()); }
+    auto make() -> std::pair<node*, tree> {
+        auto t = new node{};
+        return {t, tree{static_cast<tree_node*>(t)}};
+    }
+
+    /// <grammar> ::= <rule> | CODE
+    tree parse_grammar() {
+        auto [root, t] = make<tree_node_root>();
+        while (tok.type != tk::eof) {
+            /// Add code as a node to the root.
+            if (tok.type == tk::code) {
+                auto [code, node] = make<tree_node_code>();
+                code->text = std::move(tok.text);
+                tok.text = {};
+                root->add(std::move(node));
+                next();
+            }
+
+            /// Parse a rule and add it.
+            else { root->add(parse_rule()); }
+        }
+        return std::move(t);
+    }
+};
+
 } // namespace ebnfc
 
 #endif // EBNFC_COMPILER_HH
