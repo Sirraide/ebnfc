@@ -18,6 +18,7 @@ using options = clopts<// clang-format off
 
 int main(int argc, char** argv) {
     options::parse(argc, argv);
-    ebnfc::lexer l{options::get<"file">()->contents, options::get<"file">()->path.string()};
-    l.dump();
+    ebnfc::parser p{options::get<"file">()->contents, options::get<"file">()->path.string()};
+    auto tree = p.parse();
+    ebnfc::print_tree(tree.get());
 }

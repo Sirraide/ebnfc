@@ -5,6 +5,7 @@
 #include <functional>
 #include <mutex>
 #include <ranges>
+#include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
 #include <utility>
@@ -224,8 +225,8 @@ struct lexer {
         if (d.sev == severity::error or d.sev == severity::ice) std::exit(1);
     };
 
-    lexer() = default;
-    lexer(std::string_view _input, std::string_view _filename = "<input>")
+    explicit lexer() = default;
+    explicit lexer(std::string_view _input, std::string_view _filename = "<input>")
         : input{_input},
           filename{_filename},
           curr{input.data()},
@@ -298,7 +299,7 @@ struct lexer {
         }
 
         /// Skip whitespace.
-        while (std::isspace(lastc)) next_char();
+        skip_whitespace();
 
         /// Set the start of the token.
         tok.pos.start = u32(curr - input.data() - 1);
@@ -336,7 +337,7 @@ struct lexer {
                 next_char();
                 break;
             case '|':
-                tok.type = tk::def;
+                tok.type = tk::alternative;
                 next_char();
                 break;
             case '<':
@@ -379,6 +380,10 @@ struct lexer {
             next();
         } while (tok.type != tk::eof);
     }
+
+    void skip_whitespace() {
+        while (std::isspace(lastc)) next_char();
+    }
 };
 
 /// ===========================================================================
@@ -388,14 +393,14 @@ struct lexer {
 struct tree_node {
     loc pos;
     tree_node* parent{};
-    virtual ~tree_node() {}
+    virtual ~tree_node() = default;
 };
 
 /// Tree node.
 using tree = std::unique_ptr<tree_node>;
 
 /// An AST node containing child nodes.
-struct tree_node_container : public tree_node {
+struct tree_node_container : tree_node {
     tree_node_container() = default;
     std::vector<tree> children;
 
@@ -406,41 +411,41 @@ struct tree_node_container : public tree_node {
 };
 
 /// The root of the AST.
-struct tree_node_root : tree_node_container {};
+struct tree_node_root final : tree_node_container {};
 
 /// The root may contain code.
-struct tree_node_code : tree_node {
+struct tree_node_code final : tree_node {
     std::string text;
 };
 
 /// A rule in the AST.
-struct tree_node_rule : public tree_node_container {
+struct tree_node_rule final : tree_node_container {
     std::string nonterminal;
 };
 
 /// An alternative of a rule.
-struct tree_node_alternative : public tree_node_container {
+struct tree_node_alternative final : tree_node_container {
     std::string return_type;
     std::string code;
 };
 
 /// A term in an alternative.
-struct tree_node_nonterminal : tree_node {
+struct tree_node_nonterminal final : tree_node {
     std::string text;
 };
-struct tree_node_identifier : tree_node {
+struct tree_node_identifier final : tree_node {
     std::string text;
 };
-struct tree_node_group : tree_node_container {};
-struct tree_node_optional : tree_node_container {};
-struct tree_node_repetition : tree_node_container {};
+struct tree_node_group final : tree_node_container {};
+struct tree_node_optional final : tree_node_container {};
+struct tree_node_repetition final : tree_node_container {};
 
 /// ===========================================================================
 ///  Parser
 /// ===========================================================================
 struct parser : lexer {
     /// Forward input and filename to the lexer.
-    parser(std::string_view input, std::string_view filename) : lexer(input, filename) {}
+    parser(std::string_view code, std::string_view path) : lexer(code, path) {}
 
     /// Make a new AST node.
     template <typename node>
@@ -451,7 +456,7 @@ struct parser : lexer {
     }
 
     /// <grammar> ::= <rule> | CODE
-    tree parse_grammar() {
+    tree parse() {
         auto [root, t] = make<tree_node_root>();
         while (tok.type != tk::eof) {
             /// Add code as a node to the root.
@@ -468,7 +473,180 @@ struct parser : lexer {
         }
         return std::move(t);
     }
+
+    /// <rule> ::= NONTERMINAL ASSIGN <alternatives> [ SEMICOLON ]
+    tree parse_rule() {
+        /// Get the name of the rule.
+        auto [rule, t] = make<tree_node_rule>();
+        if (tok.type != tk::nonterminal) err(tok.pos, "Expected nonterminal");
+        rule->nonterminal = std::move(tok.text);
+        rule->pos = tok.pos;
+        tok.text = {};
+        next();
+
+        /// Yeet "::=".
+        if (tok.type != tk::def) err(tok.pos, "Expected `::=`");
+        next();
+
+        /// Parse the alternatives.
+        parse_alternatives(rule->children);
+        if (tok.type == tk::semicolon) next();
+        return std::move(t);
+    }
+
+    /// <alternatives> ::= <alternative> { ALTERNATIVE <alternative> }
+    void parse_alternatives(std::vector<tree>& nodes) {
+        /// Parse the first alternative.
+        nodes.push_back(parse_alternative());
+
+        /// Parse the rest of the alternatives.
+        while (tok.type == tk::alternative) {
+            next();
+            nodes.push_back(parse_alternative());
+        }
+    }
+
+    /// <alternative> ::= <term> { <term> } [ ARROW IDENTIFIER ] [ CODE ]
+    tree parse_alternative() {
+        auto [alt, t] = make<tree_node_alternative>();
+
+        /// Parse the first term.
+        alt->add(parse_term());
+        alt->pos = alt->children[0]->pos;
+
+        /// Parse the rest of the terms.
+        ///
+        /// If the current token is a nonterminal, we skip whitespace
+        /// in the lexer and see if we end up with a colon; if we do,
+        /// then it’s likely that the next token is '::=', which means
+        /// that this is the start of a new rule.
+        while ((tok.type == tk::nonterminal and (skip_whitespace(), lastc != ':'))
+               or tok.type == tk::identifier
+               or tok.type == tk::lparen
+               or tok.type == tk::lbrack
+               or tok.type == tk::lbrace) {
+            alt->add(parse_term());
+        }
+
+        /// Parse the return type if there is one.
+        if (tok.type == tk::arrow) {
+            next();
+            if (tok.type != tk::identifier) err(tok.pos, "Expected identifier");
+            alt->return_type = std::move(tok.text);
+            tok.text = {};
+            next();
+        }
+
+        /// Add the code if there is any.
+        if (tok.type == tk::code) {
+            alt->code = std::move(tok.text);
+            tok.text = {};
+            next();
+        }
+
+        return std::move(t);
+    }
+
+    /// <term> ::= NONTERMINAL | IDENTIFIER | <group> | <optional> | <repetition>
+    tree parse_term() {
+        switch (tok.type) {
+            case tk::nonterminal: {
+                auto [nt, t] = make<tree_node_nonterminal>();
+                nt->text = std::move(tok.text);
+                nt->pos = tok.pos;
+                tok.text = {};
+                next();
+                return std::move(t);
+            }
+            case tk::identifier: {
+                auto [id, t] = make<tree_node_identifier>();
+                id->text = std::move(tok.text);
+                id->pos = tok.pos;
+                tok.text = {};
+                next();
+                return std::move(t);
+            }
+            case tk::lparen: return parse_bracketed_alternatives<tree_node_group, tk::rparen>();
+            case tk::lbrack: return parse_bracketed_alternatives<tree_node_optional, tk::rbrack>();
+            case tk::lbrace: return parse_bracketed_alternatives<tree_node_repetition, tk::rbrace>();
+            default: err(tok.pos, "Expected term");
+        }
+    }
+
+    /// <group>      ::= LPAREN <alternatives> RPAREN
+    /// <optional>   ::= LBRACK <alternatives> RBRACK
+    /// <repetition> ::= LBRACE <alternatives> RBRACE
+    template <typename node_type, tk close>
+    tree parse_bracketed_alternatives() {
+        auto [node, t] = make<node_type>();
+        node->pos = tok.pos;
+        next();
+        parse_alternatives(node->children);
+        if (tok.type != close) err(tok.pos, "Expected '{}'", tk_to_str(close));
+        next();
+        return std::move(t);
+    }
 };
+
+/// Print a tree.
+void print_tree(const tree_node* t, std::string leading_text = "") {
+    static const auto dump_children = [](const std::vector<tree>& children, std::string text) {
+        for (auto it = children.begin(); it != children.end(); ++it) {
+            fmt::print("\033[31m{}{}", text, it + 1 == children.end() ? "└─" : "├─");
+            print_tree(it->get(), text + (it + 1 == children.end() ? "  " : "│ "));
+        }
+    };
+
+    /// Root node.
+    if (auto* root = dynamic_cast<const tree_node_root*>(t)) {
+        for (auto& child : root->children) print_tree(child.get());
+    }
+
+    /// Rule node.
+    else if (auto* rule = dynamic_cast<const tree_node_rule*>(t)) {
+        fmt::print("\033[31mRule \033[35m<{}>\n", t->pos.start);
+        dump_children(rule->children, leading_text);
+    }
+
+    /// Alternative node.
+    else if (auto* alt = dynamic_cast<const tree_node_alternative*>(t)) {
+        fmt::print("\033[31mAlternative \033[35m<{}>\n", t->pos.start);
+        dump_children(alt->children, leading_text);
+    }
+
+    /// Nonterminal node.
+    else if (auto* nt = dynamic_cast<const tree_node_nonterminal*>(t)) {
+        fmt::print("\033[31mNonterminal \033[35m<{}> \033[32m<{}>\033[0m\n", t->pos.start, nt->text);
+    }
+
+    /// Identifier node.
+    else if (auto* id = dynamic_cast<const tree_node_identifier*>(t)) {
+        fmt::print("\033[31mIdentifier \033[35m<{}> \033[33m{}\033[0m\n", t->pos.start, id->text);
+    }
+
+    /// Group node.
+    else if (auto* group = dynamic_cast<const tree_node_group*>(t)) {
+        fmt::print("\033[31mGroup \033[35m<{}>\n", t->pos.start);
+        dump_children(group->children, leading_text);
+    }
+
+    /// Optional node.
+    else if (auto* opt = dynamic_cast<const tree_node_optional*>(t)) {
+        fmt::print("\033[31mOptional \033[35m<{}>\n", t->pos.start);
+        dump_children(opt->children, leading_text);
+    }
+
+    /// Repetition node.
+    else if (auto* rep = dynamic_cast<const tree_node_repetition*>(t)) {
+        fmt::print("\033[31mRepetition \033[35m<{}>\n", t->pos.start);
+        dump_children(rep->children, leading_text);
+    }
+
+    /// Unknown node.
+    else {
+        fmt::print("\033[31mUnknown node\033[0m\n");
+    }
+}
 
 } // namespace ebnfc
 
