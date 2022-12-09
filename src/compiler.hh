@@ -387,7 +387,7 @@ struct lexer {
 /// Base for a node in the AST.
 struct tree_node {
     loc pos;
-    tree_node* parent;
+    tree_node* parent{};
     virtual ~tree_node() {}
 };
 
@@ -440,7 +440,7 @@ struct tree_node_repetition : tree_node_container {};
 /// ===========================================================================
 struct parser : lexer {
     /// Forward input and filename to the lexer.
-    parser(std::string input, std::string filename) : lexer(std::move(input), std::move(filename)) {}
+    parser(std::string_view input, std::string_view filename) : lexer(input, filename) {}
 
     /// Make a new AST node.
     template <typename node>
